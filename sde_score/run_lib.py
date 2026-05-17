@@ -22,11 +22,11 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR = os.path.dirname(CURRENT_DIR)
 sys.path.append(PARENT_DIR)
 
-from loaders import Channels, map_complex_to_components, map_components_to_complex
-import channel_sampling as sampling
-from controllable_channel_generation import get_pc_conditional_sampler
+from loaders import Channels, map_complex_to_components, map_components_to_complex # 数据加载器
+import channel_sampling as sampling # 信道采样
+from controllable_channel_generation import get_pc_channel_sampler 
 
-def train(config, workdir):
+def train(config, workdir): # 训练主函数
   """Runs the training pipeline.
 
   @:param
@@ -35,7 +35,7 @@ def train(config, workdir):
       contains checkpoint training will be resumed from the latest checkpoint.
   """
 
-  # Create directories for experimental logs
+  # Create directories for experimental logs 创建TensorBoard日志目录
   tb_dir = os.path.join(workdir, "tensorboard")
   tf.io.gfile.makedirs(tb_dir)
   writer = tensorboard.SummaryWriter(tb_dir)
@@ -56,7 +56,12 @@ def train(config, workdir):
 
   # Resume training when intermediate checkpoints are detected
   if config.training.resume:
-    state = restore_checkpoint(checkpoint_meta_dir, state, config.device)
+    #state = restore_checkpoint(checkpoint_meta_dir, state, config.device)
+    try:
+      state = restore_checkpoint(checkpoint_meta_dir, state, config.device)
+    except Exception as e:
+      print(f"Could not restore checkpoint: {e}. Starting from scratch.")
+    # 继续使用初始的 state
   initial_step = int(state['step'])
 
   # Build data iterators
@@ -105,7 +110,7 @@ def train(config, workdir):
   print("Starting training loop at step %d." % (initial_step,))
 
   for step in range(initial_step, num_train_steps + 1):
-    # Compute loss by Hermitian channels
+    # Compute loss by Hermitian channels 
     try:
       sample = next(train_iter)['H_herm'] # (batch_size, 2, n_tx, n_rx)
     except:
@@ -169,7 +174,7 @@ def train(config, workdir):
         n_steps = 1  # @param {"type": "integer"}
         probability_flow = False  # @param {"type": "boolean"}
 
-        pc_conditional_sampler = get_pc_conditional_sampler(sde, sampling_shape, predictor, corrector, snr,
+        pc_conditional_sampler = get_pc_channel_sampler(sde, sampling_shape, predictor, corrector, snr,
                                                                      n_steps=n_steps, probability_flow=probability_flow,
                                                                      continuous=config.training.continuous)
 

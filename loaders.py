@@ -1,15 +1,99 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-
-import torch, hdf5storage
-from torch.utils.data import Dataset
-import numpy as np
-import scipy.io as sio
-
 import os
-PARENT_DIR = os.path.dirname(os.path.realpath(__file__))
+import sys
 
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+
+try:
+    import hdf5storage  # type: ignore
+except ImportError:  # pragma: no cover - depends on the runtime env
+    hdf5storage = None
+
+try:
+    import scipy.io as sio  # type: ignore
+except ImportError:  # pragma: no cover - depends on the runtime env
+    sio = None
+sys.path.append('../')
+PARENT_DIR = os.path.dirname(os.path.realpath(__file__))
+#ROOT_DIR = os.path.dirname(PROJECT_DIR)
+ROOT_DIR = os.path.dirname(PARENT_DIR)
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
+DEFAULT_DEEPMIMO_SCENARIOS = ['O1_28B', 'O1_28', 'I2_28B']
+DEFAULT_LEO_SCENARIOS = ['Rural', 'Urban', 'DenseUrban']
+
+
+def _load_mat_file(filename):
+    if hdf5storage is not None:
+        return hdf5storage.loadmat(filename)
+    if sio is not None:
+        return sio.loadmat(filename)
+    raise ImportError(
+        "Neither `hdf5storage` nor `scipy.io` is available. "
+        "Install one of them to read `.mat` channel datasets."
+    )
+
+
+def normalize_scenario_name(scenario):
+    """Map accepted aliases to the canonical scenario name used by this repo."""
+    if scenario.startswith('LEO_'):
+        scenario = scenario[len('LEO_'):]
+    return scenario
+
+
+def expand_scenarios(train_or_test):
+    """Expand aggregate scenario names into explicit scenario lists."""
+    if train_or_test == 'mixed':
+        return list(DEFAULT_DEEPMIMO_SCENARIOS)
+    if train_or_test in ('mixed_leo', 'LEO_mixed'):
+        return list(DEFAULT_LEO_SCENARIOS)
+    return [normalize_scenario_name(train_or_test)]
+
+
+def resolve_dataset_path(scenario, seed, num_paths=10):
+    """Return the dataset path for either DeepMIMO or LEO naming conventions."""
+    scenario = normalize_scenario_name(scenario)
+    leo_filename = os.path.join(PARENT_DIR, f'dataset/LEO_{scenario}_seed{seed}.mat')
+    deepmimo_filename = os.path.join(
+        PARENT_DIR,
+        f'DeepMIMO-5GNR/DeepMIMO_dataset/{scenario}_path{num_paths}_seed{seed}.mat',
+    )
+    candidates = [leo_filename, deepmimo_filename]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    raise FileNotFoundError(
+        f"Could not find dataset for scenario `{scenario}` and seed `{seed}`. "
+        f"Tried: {candidates}"
+    )
+
+
+def load_channel_array(scenario_list, seed, num_paths):
+    channels = np.array([], dtype='complex64')
+    filenames = []
+    for scenario in scenario_list:
+        filename = resolve_dataset_path(scenario, seed, num_paths=num_paths)
+        filenames.append(filename)
+        contents = _load_mat_file(filename)
+        channel_scenario = np.asarray(contents['channels'], dtype=np.complex64)
+        if len(channels) < 1:
+            channels = channel_scenario
+        else:
+            channels = np.concatenate((channels, channel_scenario), axis=0)
+    channels = np.asarray(channels)
+    channels = np.reshape(channels, (-1, channels.shape[-2], channels.shape[-1]))
+    return channels, filenames
+
+
+def infer_channel_image_size(scenario_list, seed=1111, num_paths=10):
+    channels, _ = load_channel_array(scenario_list, seed, num_paths)
+    n_rx, n_tx = channels.shape[-2], channels.shape[-1]
+    return [n_tx, n_rx]
 
 def transpose_3d(x):
     return x.transpose([0, 2, 1])
@@ -33,30 +117,15 @@ class Channels(Dataset):
         self.spacings = np.copy(config.data.spacing_list)
         self.filenames = []
         # self.gan = gan
-        n_tx, n_rx = config.data.image_size[0], config.data.image_size[1]
-        self.n_tx, self.n_rx = n_tx, n_rx
-
         ################ Load channels from files ############
-        self.channels = np.array([], dtype='complex64')
-        # For single/mixed scenario
-        for scenario in config.data.scenario_list:
-            # File name of DeepMIMO dataset
-            filename = os.path.join(PARENT_DIR,
-                                    f'DeepMIMO-5GNR/DeepMIMO_dataset/{scenario}_path{self.num_paths}_seed{seed}.mat')
-            self.filenames.append(filename)
-            # Load dataset
-            contents = hdf5storage.loadmat(filename)
-            channels = np.asarray(contents['channels'], dtype=np.complex64)
-
-            if len(self.channels) < 1:
-                self.channels = channels
-            else:
-                np.concatenate((self.channels, channels), 0)
-
-        # Convert to array
-        self.channels = np.asarray(self.channels)
-        self.channels = np.reshape(self.channels,
-                                   (-1, self.channels.shape[-2], self.channels.shape[-1]))
+        self.channels, self.filenames = load_channel_array(
+            config.data.scenario_list,
+            seed,
+            self.num_paths,
+        )
+        n_rx, n_tx = self.channels.shape[-2], self.channels.shape[-1]
+        self.n_tx, self.n_rx = n_tx, n_rx
+        config.data.image_size = [n_tx, n_rx]
         # Channel normalization
         if norm == 'global':
             self.mean = 0.
@@ -67,6 +136,9 @@ class Channels(Dataset):
         elif type(norm) == list:
             self.mean = norm[0]
             self.std = norm[1]
+        else:
+            self.mean = 0.
+            self.std = np.std(self.channels)
 
         # Sample random QPSK pilots
         self.pilots = 1 / np.sqrt(2) * (2 * np.random.binomial(1, 0.5, size=(

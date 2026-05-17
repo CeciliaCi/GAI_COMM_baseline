@@ -5,7 +5,7 @@ import sys, copy, argparse
 from controllable_channel_generation import get_pc_channel_sampler
 
 sys.path.append('./')
-from loaders import Channels
+from loaders import Channels, expand_scenarios, infer_channel_image_size
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 import numpy as np
@@ -29,7 +29,16 @@ if __name__ == '__main__':
     # Args
     parser = argparse.ArgumentParser()
     parser.add_argument('--gpu_id', type=int, default=0)
-    parser.add_argument('--train', type=str, default='mixed', help="Training scenario. Supported values: 'O1_28B', 'O1_28', 'I2_28B', 'mixed'")
+    parser.add_argument(
+        '--train',
+        type=str,
+        default='mixed',
+        help=(
+            "Training scenario. Supported values include "
+            "'O1_28B', 'O1_28', 'I2_28B', 'mixed', "
+            "'Rural', 'Urban', 'DenseUrban', 'mixed_leo'."
+        ),
+    )
     parser.add_argument('--test', type=str, default='mixed')
     parser.add_argument('--model_pth', type=str, default='checkpoint_20.pth', help="File name of the saved model")
     parser.add_argument('--spacing', nargs='+', type=float, default=[0.5])
@@ -66,6 +75,12 @@ if __name__ == '__main__':
         else:
             assert("The model cannot be found")
         config = configs.get_config()
+        config.data.scenario_list = expand_scenarios(args.train)
+        config.data.image_size = infer_channel_image_size(
+            config.data.scenario_list,
+            seed=1111,
+            num_paths=config.data.num_paths,
+        )
         sde = VESDE(sigma_min=config.model.sigma_min, sigma_max=config.model.sigma_max, N=config.model.num_scales)
         sampling_eps = 1e-5
     elif sde.lower() == 'vpsde':
@@ -90,12 +105,12 @@ if __name__ == '__main__':
     train_seed, val_seed = 1111, 2222
     # Training dataset
     config.data.channel = args.train
-    config.data.scenario_list = ['O1_28B', 'O1_28', 'I2_28B'] if args.train == 'mixed' else [args.train]
+    config.data.scenario_list = expand_scenarios(args.train)
     dataset = Channels(train_seed, config, norm=config.data.norm_channels)
     # Validation dataset
     val_config = copy.deepcopy(config)
     val_config.data.channel = args.test
-    val_config.data.scenario_list = ['O1_28B', 'O1_28', 'I2_28B'] if args.test=='mixed' else [args.test]
+    val_config.data.scenario_list = expand_scenarios(args.test)
     val_config.data.num_pilots = int(np.floor(config.data.image_size[0] * args.pilot_alpha))
     val_config.data.spacing_list = args.spacing
     if args.train == 'O1_28':
@@ -124,7 +139,7 @@ if __name__ == '__main__':
         'H_herm'].cuda()  # (num_test_sample, 2, n_tx, n_rx)  # Hermitian channel coefficients
     val_H_herm = val_H_herm_coefficients[:, 0] + 1j * val_H_herm_coefficients[:, 1]  # Complex Hermitian channel matrix
     ground_truth = val_H_herm  # Ground truth channels
-    shape = (batch_size, 2, 64, 16)
+    shape = (batch_size, 2, config.data.image_size[0], config.data.image_size[1])
 
 
     # For different SNR scenarios

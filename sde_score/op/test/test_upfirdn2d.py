@@ -8,7 +8,7 @@ from torch.utils.cpp_extension import load
 from torch.nn import functional as F
 from torch.autograd import Function
 
-torch.cuda.set_device(1)
+torch.cuda.set_device(0)  #1->0!!
 
 # Load Pytorch extension
 module_path = os.path.dirname(__file__)

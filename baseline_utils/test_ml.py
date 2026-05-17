@@ -80,7 +80,12 @@ if not args.test == 'mixed':
 else:
     val_config.data.scenario_list = ['O1_28B', 'O1_28', 'I2_28B']
 val_config.data.spacing_list = [args.spacing]
-val_config.data.num_pilots = int(np.floor(args.antennas[1] * args.pilot_alpha))
+#val_config.data.num_pilots = int(np.floor(args.antennas[1] * args.pilot_alpha))
+# 确保取单个数值，而非数组
+antennas_1 = args.antennas[1] if isinstance(args.antennas, (list, np.ndarray)) else args.antennas
+pilot_alpha = args.pilot_alpha[0] if isinstance(args.pilot_alpha, (list, np.ndarray)) else args.pilot_alpha
+val_config.data.num_pilots = int(np.floor(antennas_1 * pilot_alpha))
+#
 val_dataset = Channels(val_seed, val_config, norm=[dataset.mean, dataset.std])
 val_loader = DataLoader(val_dataset, batch_size=num_test_sample, shuffle=True, num_workers=0, drop_last=True)
 val_iter = iter(val_loader)
@@ -131,7 +136,8 @@ avg_nmse = np.mean(nmse_all, axis=-1)
 # Plot results
 plt.rcParams['font.size'] = 14
 plt.figure(figsize=(10, 10))
-plt.plot(snr_range, avg_nmse[0, 0], linewidth=4, label=f'{args.test}, Maximum likelihood')
+#plt.plot(snr_range, avg_nmse[0, 0], linewidth=4, label=f'{args.test}, Maximum likelihood')
+plt.plot(snr_range, avg_nmse, linewidth=4, label=f'{args.test}, Maximum likelihood')
 plt.grid()
 plt.legend()
 plt.title('Channel estimation')
@@ -143,9 +149,16 @@ plt.savefig(os.path.join(result_dir, 'results_mse.png'), dpi=300,
 plt.close()
 
 # Save to file
+# torch.save({'snr_range': snr_range,
+#             'spacing': args.spacing,
+#             'pilot_alpha': args.pilot_alpha,
+#             'nmse_all': nmse_all,
+#             'avg_nmse': avg_nmse
+#             }, result_dir + f'/results_Nt{args.data.image_size[0]}_Nr{args.data.image_size[1]}.pt')
 torch.save({'snr_range': snr_range,
             'spacing': args.spacing,
             'pilot_alpha': args.pilot_alpha,
             'nmse_all': nmse_all,
             'avg_nmse': avg_nmse
-            }, result_dir + f'/results_Nt{args.data.image_size[0]}_Nr{args.data.image_size[1]}.pt')
+            }, result_dir + f'/results_Nt{args.antennas[0]}_Nr{args.antennas[1]}.pt')
+

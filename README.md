@@ -22,11 +22,22 @@ The following ray-tracing scenes constructed by [DeepMIMO](https://www.deepmimo.
 > If you'd like to prepare your own datasets, download [DeepMIMO ray-tracing data](https://www.deepmimo.net/scenarios/) and follow their instructions. <br>
 > We also provide the script [here](./DeepMIMO-5GNR/DeepMIMO_Dataset_Generator.m) to generate and save our datasets.
 
+The repository also supports LEO-NTN channel datasets with the naming rule `LEO_<Scenario>_seed<Seed>.mat`, where `<Scenario>` is one of `Rural`, `Urban`, or `DenseUrban`. These files should be placed in [`dataset/`](./dataset). The loader automatically resolves either DeepMIMO files such as `O1_28_path10_seed1111.mat` or LEO files such as `LEO_Rural_seed1111.mat`.
+
 
 ## Training and Test
 + Train the score SDE based (unconditioned) diffusion model through [`train_diffusion_model.py`](./train_diffusion_model.py) after preparing the dataset. 
   > The diffusion model generally achieves satisfactory performance after $200,000$ training iterations. But $400,000$ training iterations still yield slight improvements in our experiments.
 + Test the conditional diffusion model by runnig [`test_diffusion_model.py`](./test_diffusion_model.py). <br>
++ Train the WGAN-GP baseline through [`baseline_utils/wgan_gp.py`](./baseline_utils/wgan_gp.py). The script uses the same scenario names as the diffusion-model entrypoints, including `Rural`, `Urban`, `DenseUrban`, and `mixed_leo`.
+
+Example commands:
+
+```bash
+python train_diffusion_model.py --gpu_id 0 --train Rural --workdir models/DM/Rural
+python baseline_utils/wgan_gp.py --gpu 0 --train Rural
+python testcici.py --scenario Rural
+```
 
 
 ## Our Pretrained Checkpoints 

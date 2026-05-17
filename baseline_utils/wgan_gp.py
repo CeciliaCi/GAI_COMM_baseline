@@ -1,8 +1,24 @@
-import copy
+import argparse
+import os
+import sys
 
-import torch, hdf5storage, os
+import numpy as np
+import torch
+import torch.autograd as autograd
+import torch.optim as optim
 
-from wgan_helper import *
+CURRENT_DIR = os.path.dirname(os.path.realpath(__file__))
+PROJECT_DIR = os.path.dirname(CURRENT_DIR)
+if PROJECT_DIR not in sys.path:
+    sys.path.insert(0, PROJECT_DIR)
+
+try:
+    from baseline_utils.wgan_helper import Conv2d, Variable, View, dtype
+except ImportError:
+    from wgan_helper import Conv2d, Variable, View, dtype
+
+from loaders import _load_mat_file, expand_scenarios, load_channel_array
+
 reset_optim_D = True
 
 # Disable TF32 due to potential precision issues
@@ -11,181 +27,199 @@ torch.backends.cudnn.allow_tf32 = False
 torch.backends.cudnn.benchmark = True
 
 
-import os
-PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+def make_dft_matrix(size):
+    row = np.arange(size).reshape(-1, 1)
+    col = np.arange(size).reshape(1, -1)
+    return np.exp(-2j * np.pi * row * col / size).astype(np.complex64) / np.sqrt(size)
 
-def loadChannels(config, seed):
-    channels = np.array([], dtype='complex64')
-    for scenario in config.scenario_list:
-        fileName = os.path.join(PROJECT_DIR, f'DeepMIMO-5GNR/DeepMIMO_dataset/{scenario}_path{config.num_paths}_seed{seed}.mat')
-        contents = hdf5storage.loadmat(fileName)
-        channel_scenario = np.asarray(contents['channels'], dtype=np.complex64)
-        if len(channels) < 1:
-            channels = channel_scenario
-        else:
-            np.concatenate((channels, channel_scenario), 0)
-    channels = np.transpose(channels, (1, 2, 0))
 
-    # Normalize
-    mu = np.zeros([1])
+def load_dft_basis(n_tx, n_rx):
+    dft_basis = _load_mat_file(os.path.join(PROJECT_DIR, 'data/dft_basis.mat'))
+    a_t = dft_basis.get('A1')
+    a_r = dft_basis.get('A2')
+    if a_t is None or a_t.shape != (n_tx, n_tx):
+        a_t = make_dft_matrix(n_tx)
+    else:
+        a_t = a_t / np.sqrt(n_tx)
+    if a_r is None or a_r.shape != (n_rx, n_rx):
+        a_r = make_dft_matrix(n_rx)
+    else:
+        a_r = a_r / np.sqrt(n_rx)
+    return a_t, a_r
+
+
+def load_training_tensor(scenario_list, seed, num_paths, n_tx=None, n_rx=None):
+    channels, filenames = load_channel_array(scenario_list, seed, num_paths)
+    channels = np.transpose(channels, (1, 2, 0))  # [N_r, N_t, n]
+    actual_n_rx, actual_n_tx = channels.shape[0], channels.shape[1]
+    n_tx = actual_n_tx if n_tx is None else n_tx
+    n_rx = actual_n_rx if n_rx is None else n_rx
+    if (n_rx, n_tx) != (actual_n_rx, actual_n_tx):
+        raise ValueError(
+            f'Configured WGAN dimensions (N_r={n_rx}, N_t={n_tx}) do not match '
+            f'loaded channels (N_r={actual_n_rx}, N_t={actual_n_tx}).'
+        )
+    mu = np.zeros([1], dtype=np.float32)
     std = np.std(channels)
-    channels = (channels - mu)/std
+    channels = (channels - mu) / std
 
-    return np.asarray(channels)
+    h_extracted = np.transpose(channels.copy(), (2, 1, 0))  # [n, N_t, N_r]
+    a_t, a_r = load_dft_basis(n_tx, n_rx)
+    for idx in range(h_extracted.shape[0]):
+        h_extracted[idx] = np.transpose(
+            np.matmul(np.matmul(a_r.conj().T, h_extracted[idx].T), a_t).astype(np.complex64)
+        )
+
+    img_np = np.zeros((channels.shape[2], 2, n_tx, n_rx), dtype=np.float32)
+    img_np[:, 0, :, :] = np.real(h_extracted)
+    img_np[:, 1, :, :] = np.imag(h_extracted)
+    return img_np, filenames, float(std)
+
+
+def build_generator(latent_dim, batch_size, length, breadth):
+    generator = torch.nn.Sequential(
+        torch.nn.Linear(latent_dim, 128 * length * breadth),
+        torch.nn.ReLU(),
+        View([batch_size, 128, length, breadth]),
+        torch.nn.Upsample(scale_factor=2),
+        Conv2d(128, 128, 4, bias=False),
+        torch.nn.BatchNorm2d(128, momentum=0.8),
+        torch.nn.ReLU(),
+        torch.nn.Upsample(scale_factor=2),
+        Conv2d(128, 128, 4, bias=False),
+        torch.nn.BatchNorm2d(128, momentum=0.8),
+        torch.nn.ReLU(),
+        Conv2d(128, 2, 4, bias=False),
+    )
+    return generator.type(dtype)
+
+
+def build_discriminator(n_tx=64, n_rx=16):
+    feature_layers = torch.nn.Sequential(
+        Conv2d(2, 16, 3, stride=2),
+        torch.nn.LeakyReLU(0.2, inplace=True),
+        torch.nn.Dropout(0.25),
+        Conv2d(16, 32, 3, stride=2),
+        torch.nn.ZeroPad2d(padding=(0, 1, 0, 1)),
+        torch.nn.LeakyReLU(0.2, inplace=True),
+        torch.nn.Dropout(0.25),
+        Conv2d(32, 64, 3, stride=2),
+        torch.nn.LeakyReLU(0.2, inplace=True),
+        torch.nn.Dropout(0.25),
+        Conv2d(64, 128, 3, stride=1),
+        torch.nn.LeakyReLU(0.2, inplace=True),
+        torch.nn.Dropout(0.25),
+    )
+    with torch.no_grad():
+        dummy = torch.zeros(1, 2, n_tx, n_rx)
+        flatten_dim = feature_layers(dummy).reshape(1, -1).shape[1]
+    discriminator = torch.nn.Sequential(
+        feature_layers,
+        torch.nn.Flatten(),
+        torch.nn.Linear(flatten_dim, 1),
+    )
+    return discriminator.type(dtype)
+
+
+def compute_gradient_penalty(discriminator, real_samples, fake_samples):
+    """Calculates the gradient penalty loss for WGAN-GP."""
+    alpha = dtype(np.random.random((real_samples.size(0), 1, 1, 1)))
+    interpolates = (alpha * real_samples + (1 - alpha) * fake_samples).requires_grad_(True)
+    d_interpolates = discriminator(interpolates)
+    fake = Variable(dtype(real_samples.shape[0], 1).fill_(1.0), requires_grad=False)
+    gradients = autograd.grad(
+        outputs=d_interpolates,
+        inputs=interpolates,
+        grad_outputs=fake,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+    gradients = torch.reshape(gradients, (gradients.size(0), -1))
+    return ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+
 
 if __name__ == '__main__':
-    #Parameters
-    N_t = 64
-    N_r = 16
-    latent_dim = 65
-    lambda_gp = 10
-
     parser = argparse.ArgumentParser()
-    parser.add_argument('--gpu', type=int, default=0)  # Assign the gpu device idx
+    parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--train', type=str, default='mixed')
-    parser.add_argument('--scenario_list', type=list, default='mixed')
-    parser.add_argument('--num_paths', type=list, default=10)
-    config = parser.parse_args()
+    parser.add_argument('--num_paths', type=int, default=10)
+    parser.add_argument('--batch_size', type=int, default=200)
+    parser.add_argument('--n_iters', type=int, default=60000)
+    parser.add_argument('--critic_steps', type=int, default=5)
+    parser.add_argument('--latent_dim', type=int, default=65)
+    parser.add_argument('--lr', type=float, default=5e-5)
+    parser.add_argument('--lambda_gp', type=float, default=10.0)
+    parser.add_argument('--save_freq', type=int, default=2000)
+    args = parser.parse_args()
 
-    torch.cuda.set_device(config.gpu)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(args.gpu)
 
-    config.scenario_list = ['O1_28','O1_28B','I2_28B'] if config.train == 'mixed' else [config.train]
-    model_dir = os.path.join(PROJECT_DIR, f'models/wgan_gp/{config.train}/')
+    scenario_list = expand_scenarios(args.train)
+    model_dir = os.path.join(PROJECT_DIR, 'models', 'wgan_gp', args.train)
     os.makedirs(model_dir, exist_ok=True)
 
-    # Seeds for train and test datasets
-    train_seed, val_seed = 1111, 2222
-
-    H_ori = loadChannels(config, train_seed) #  [N_r, N_t, n]
-    H_extracted = np.transpose(copy.deepcopy(H_ori),(2,1,0)) # [n, N_t, N_r]
-
-    dft_basis = sio.loadmat(os.path.join(PROJECT_DIR,"data/dft_basis.mat"))
-    A_T = dft_basis['A1']/np.sqrt(N_t)
-    A_R = dft_basis['A2']/np.sqrt(N_r)
-    for i in range(H_ori.shape[2]):
-        H_extracted[i] = np.transpose(np.matmul(np.matmul(A_R.conj().T,H_extracted[i].T,dtype='complex64'),A_T))
-
-    H_extracted_real = np.real(H_extracted)
-    H_extracted_imag = np.imag(H_extracted)
-
-    img_np = np.zeros((H_ori.shape[2],2,N_t,N_r))
-    img_np[:,0,:,:] = H_extracted_real
-    img_np[:,1,:,:] = H_extracted_imag
-    X_train = img_np
-
-    mb_size = 200
-    cnt = 0
-    lr = 5e-5
-
-    length = int(N_t/4)
-    breadth = int(N_r/4)
-
-    G = torch.nn.Sequential(
-        torch.nn.Linear(latent_dim, 128*length*breadth),
-        torch.nn.ReLU(),
-        View([mb_size,128,length,breadth]),
-        torch.nn.Upsample(scale_factor=2),
-        Conv2d(128,128,4,bias=False),
-        torch.nn.BatchNorm2d(128,momentum=0.8),
-        torch.nn.ReLU(),
-        torch.nn.Upsample(scale_factor=2),
-        Conv2d(128,128,4,bias=False),
-        torch.nn.BatchNorm2d(128,momentum=0.8),
-        torch.nn.ReLU(),
-        Conv2d(128,2,4,bias=False),
+    train_seed = 1111
+    x_train, filenames, train_std = load_training_tensor(
+        scenario_list=scenario_list,
+        seed=train_seed,
+        num_paths=args.num_paths,
     )
-    G = G.type(dtype)
+    n_tx, n_rx = x_train.shape[-2], x_train.shape[-1]
+    length = n_tx // 4
+    breadth = n_rx // 4
+    print(f'Loaded {x_train.shape[0]} training samples from: {filenames}')
+    print(f'Normalized WGAN training tensor shape: {x_train.shape}; std={train_std:.6f}')
 
-    D = torch.nn.Sequential(
-        Conv2d(2,16,3,stride=2),
-        torch.nn.LeakyReLU(0.2,inplace=True),
-        torch.nn.Dropout(0.25),
-        Conv2d(16,32,3,stride=2),
-        torch.nn.ZeroPad2d(padding=(0,1,0,1)),
-        torch.nn.LeakyReLU(0.2,inplace=True),
-        torch.nn.Dropout(0.25),
-        Conv2d(32,64,3,stride=2),
-        torch.nn.LeakyReLU(0.2,inplace=True),
-        torch.nn.Dropout(0.25),
-        Conv2d(64,128,3,stride=1),
-        torch.nn.LeakyReLU(0.2,inplace=True),
-        torch.nn.Dropout(0.25),
-        torch.nn.Flatten(),
-        torch.nn.Linear(3456,1),
-    )
-    D = D.type(dtype)
+    batch_size = min(args.batch_size, x_train.shape[0])
+    replace = x_train.shape[0] < args.batch_size
+    generator = build_generator(args.latent_dim, batch_size, length, breadth)
+    discriminator = build_discriminator(n_tx, n_rx)
 
     def reset_grad():
-        G.zero_grad()
-        D.zero_grad()
+        generator.zero_grad()
+        discriminator.zero_grad()
 
-    G_solver = optim.RMSprop(G.parameters(), lr=lr)
-    D_solver = optim.RMSprop(D.parameters(), lr=lr)
+    g_solver = optim.RMSprop(generator.parameters(), lr=args.lr)
+    d_solver = optim.RMSprop(discriminator.parameters(), lr=args.lr)
 
-    def compute_gradient_penalty(D, real_samples, fake_samples):
-        """Calculates the gradient penalty loss for WGAN GP"""
-        # Random weight term for interpolation between real and fake samples
-        alpha = dtype(np.random.random((real_samples.size(0), 1, 1, 1)))
-        # Get random interpolation between real and fake samples
-        interpolates = (alpha * real_samples + ((1 - alpha) * fake_samples)).requires_grad_(True)
-        d_interpolates = D(interpolates)
-        fake = Variable(dtype(real_samples.shape[0], 1).fill_(1.0), requires_grad=False)
-        # Get gradient w.r.t. interpolates
-        gradients = autograd.grad(
-            outputs=d_interpolates,
-            inputs=interpolates,
-            grad_outputs=fake,
-            create_graph=True,
-            retain_graph=True,
-            only_inputs=True,
-        )[0]
-        gradients = torch.reshape(gradients,(gradients.size(0), -1))
-        gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
-        return gradient_penalty
-
-    for it in range(60000):
+    for iteration in range(args.n_iters):
         if reset_optim_D:
-            D_solver = optim.RMSprop(D.parameters(), lr=lr)
-        for _ in range(5):
-            # Sample data
-            z = Variable(torch.randn(mb_size, latent_dim)).type(dtype)
-            idx = np.random.choice(X_train.shape[0], mb_size, replace = False)
-            X = X_train[idx]
-            X = Variable(torch.from_numpy(X).float()).type(dtype)
+            d_solver = optim.RMSprop(discriminator.parameters(), lr=args.lr)
 
-            # Dicriminator forward-loss-backward-update
-            G_sample = G(z)
-            D_real = D(X)
-            D_fake = D(G_sample)
-            gradient_penalty = compute_gradient_penalty(D,X,G_sample)
-            D_loss = -(torch.mean(D_real) - torch.mean(D_fake)) + lambda_gp*gradient_penalty
+        for _ in range(args.critic_steps):
+            z = Variable(torch.randn(batch_size, args.latent_dim)).type(dtype)
+            idx = np.random.choice(x_train.shape[0], batch_size, replace=replace)
+            x = Variable(torch.from_numpy(x_train[idx]).float()).type(dtype)
 
-            D_loss.backward()
-            D_solver.step()
+            g_sample = generator(z)
+            d_real = discriminator(x)
+            d_fake = discriminator(g_sample)
+            gradient_penalty = compute_gradient_penalty(discriminator, x, g_sample)
+            d_loss = -(torch.mean(d_real) - torch.mean(d_fake)) + args.lambda_gp * gradient_penalty
 
-            # Reset gradient
+            d_loss.backward()
+            d_solver.step()
             reset_grad()
 
-        # Generator forward-loss-backward-update
-        idx = np.random.choice(X_train.shape[0], mb_size, replace = False)
-        X = X_train[idx]
-        X = Variable(torch.from_numpy(X)).type(dtype)
-        z = Variable(torch.randn(mb_size, latent_dim)).type(dtype)
+        z = Variable(torch.randn(batch_size, args.latent_dim)).type(dtype)
+        g_sample = generator(z)
+        d_fake = discriminator(g_sample)
+        g_loss = -torch.mean(d_fake)
 
-        G_sample = G(z)
-        D_fake = D(G_sample)
-
-        G_loss = -torch.mean(D_fake)
-
-        G_loss.backward()
-        G_solver.step()
-
-        # Reset gradient
+        g_loss.backward()
+        g_solver.step()
         reset_grad()
-        if it%2000 == 0:
-            torch.save(G.state_dict(), model_dir + f'/generator{it}.pt')
 
-        if it % 50 == 0:
-            print(f'Iter-{it}; D_loss: {D_loss.cpu().data.numpy()}; G_loss: {G_loss.cpu().data.numpy()}')
+        if iteration % args.save_freq == 0:
+            torch.save(generator.state_dict(), os.path.join(model_dir, f'generator{iteration}.pt'))
 
-    torch.save(G.state_dict(),model_dir + '/final_model.pt')
+        if iteration % 50 == 0:
+            print(
+                f'Iter-{iteration}; '
+                f'D_loss: {d_loss.detach().cpu().item():.6f}; '
+                f'G_loss: {g_loss.detach().cpu().item():.6f}'
+            )
+
+    torch.save(generator.state_dict(), os.path.join(model_dir, 'final_model.pt'))

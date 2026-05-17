@@ -1,21 +1,19 @@
-import os, hdf5storage
+import os
+import sys
+
+PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+if PROJECT_DIR not in sys.path:
+    sys.path.insert(0, PROJECT_DIR)
+
 from baseline_utils.wgan_helper import *
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-
-PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+from loaders import _load_mat_file, expand_scenarios, load_channel_array, resolve_dataset_path
+from baseline_utils.wgan_gp import build_generator, load_dft_basis
 
 def loadValidateChannels(config, seed, mu_train, std_train):
-    channels = np.array([], dtype='complex64')
-    for scenario in config.scenario_list:
-        fileName = os.path.join(PROJECT_DIR,f'../DeepMIMO-5GNR/DeepMIMO_dataset/{scenario}_path{config.num_paths}_seed{seed}.mat')
-        contents = hdf5storage.loadmat(fileName)
-        channel_scenario = np.asarray(contents['channels'], dtype=np.complex64)
-        if len(channels) < 1:
-            channels = channel_scenario
-        else:
-            np.concatenate((channels, channel_scenario), 0)
+    channels, _ = load_channel_array(config.scenario_list, seed, config.num_paths)
     channels = np.transpose(channels, (1, 2, 0))
     channels = (channels - mu_train)/std_train  # Normalize
 
@@ -30,29 +28,8 @@ torch.backends.cudnn.benchmark = True
 
 
 #Wireless Parameters
-N_t = 64
-N_r = 16
 latent_dim = 65
 train_seed, val_seed = 1111, 2222
-
-length = int(N_t/4)
-breadth = int(N_r/4)
-
-G_test = torch.nn.Sequential(
-    torch.nn.Linear(latent_dim, 128*length*breadth),
-    torch.nn.ReLU(),
-    View([1,128,length,breadth]),
-    torch.nn.Upsample(scale_factor=2),
-    Conv2d(128,128,4,bias=False),
-    torch.nn.BatchNorm2d(128,momentum=0.8),
-    torch.nn.ReLU(),
-    torch.nn.Upsample(scale_factor=2),
-    Conv2d(128,128,4,bias=False),
-    torch.nn.BatchNorm2d(128,momentum=0.8),
-    torch.nn.ReLU(),
-    Conv2d(128,2,4,bias=False),
-)
-G_test = G_test.type(dtype)
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--gpu', type=int, default=2)
@@ -63,37 +40,46 @@ parser.add_argument('--spacing', nargs='+', type=float, default=[0.5])
 parser.add_argument('--pilot_alpha', nargs='+', type=float, default=0.6)
 config = parser.parse_args()
 
-
-dft_basis = sio.loadmat("../data/dft_basis.mat")
-A_T = dft_basis['A1']/np.sqrt(N_t)
-A_R = dft_basis['A2']/np.sqrt(N_r)
-
 ########################## Get statistics of training data ##########################
-config.train_scenario_list = ['O1_28','O1_28B','I2_28B'] if config.train == 'mixed' else [config.train]
+config.train_scenario_list = expand_scenarios(config.train)
 H_ori = None
 for scenario in config.train_scenario_list:
-    H_org = sio.loadmat(os.path.join(PROJECT_DIR,f"DeepMIMO-5GNR/DeepMIMO_dataset/{scenario}_path10_seed{train_seed}.mat"))
+    H_org = _load_mat_file(resolve_dataset_path(scenario, train_seed, num_paths=config.num_paths))
     if H_ori is None:
         H_ori = H_org['channels'].transpose((1,2,0))
     else:
         H_ori = np.concatenate((H_ori,H_org['channels'].transpose((1,2,0))),-1)
+N_r, N_t = H_ori.shape[0], H_ori.shape[1]
+if N_t % 4 != 0 or N_r % 4 != 0:
+    raise ValueError(f'WGAN generator requires N_t and N_r divisible by 4, got N_t={N_t}, N_r={N_r}.')
 mu_train = np.zeros([1])
 std_train = np.std(H_ori)
 
 ########################## Get normalized validation data ######################################
-config.test_scenario_list = ['O1_28','O1_28B','I2_28B'] if config.test == 'mixed' else [config.test]
+config.test_scenario_list = expand_scenarios(config.test)
 H_ori = None
 for scenario in config.test_scenario_list:
-    H_org = sio.loadmat(os.path.join(PROJECT_DIR,f"DeepMIMO-5GNR/DeepMIMO_dataset/{scenario}_path10_seed{val_seed}.mat"))
+    H_org = _load_mat_file(resolve_dataset_path(scenario, val_seed, num_paths=config.num_paths))
     if H_ori is None:
         H_ori = H_org['channels'][:100].transpose((1,2,0))
     else:
         H_ori = np.concatenate((H_ori,H_org['channels'][:100].transpose((1,2,0))),-1)
+if H_ori.shape[0] != N_r or H_ori.shape[1] != N_t:
+    raise ValueError(
+        f'Train/test channel dimensions do not match: '
+        f'train N_r={N_r}, N_t={N_t}; '
+        f'test N_r={H_ori.shape[0]}, N_t={H_ori.shape[1]}.'
+    )
 H_ori = (H_ori-mu_train)/std_train # normalize
+
+length = int(N_t/4)
+breadth = int(N_r/4)
+G_test = build_generator(latent_dim, 1, length, breadth)
+A_T, A_R = load_dft_basis(N_t, N_r)
 
 H_extracted = np.transpose(copy.deepcopy(H_ori),(2,1,0))
 for i in range(H_ori.shape[2]):
-    H_extracted[i] = np.transpose(np.matmul(np.matmul(A_R.conj().T,H_extracted[i].T,dtype='complex64'),A_T))
+    H_extracted[i] = np.transpose(np.matmul(np.matmul(A_R.conj().T,H_extracted[i].T),A_T).astype(np.complex64))
 H_extracted_real = np.real(H_extracted)
 H_extracted_imag = np.imag(H_extracted)
 
@@ -110,6 +96,7 @@ angles_t = np.linspace(0,2*np.pi,2**Nbit_t,endpoint=False)
 angles_r = np.linspace(0,2*np.pi,2**Nbit_r,endpoint=False)
 freq = 2000
 model_vec = range(58000,60000,freq)
+#model_vec = range(18000,20000,freq)
 
 def training_precoder(N_t,N_s):
     angle_index = np.random.choice(len(angles_t),(N_t,N_s))
@@ -123,7 +110,7 @@ def training_combiner(N_r,N_rx_rf):
 ntest = 5
 nrepeat = 100
 SNR_vec = np.arange(-10,32.5,2.5)
-pilot_alpha = config.pilot_alpha
+pilot_alpha = config.pilot_alpha[0] if isinstance(config.pilot_alpha, list) else config.pilot_alpha
 nmse_all = np.zeros((len(SNR_vec),len(model_vec),nrepeat,ntest))
 N_p = int(pilot_alpha*N_t)
 qpsk_constellation = (1/np.sqrt(2))*np.array([1+1j,1-1j,-1+1j,-1-1j])

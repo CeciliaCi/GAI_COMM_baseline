@@ -57,9 +57,10 @@ class AttnBlockpp(nn.Module):
     self.skip_rescale = skip_rescale
 
   def forward(self, x):
-    B, C, H, W = x.shape
+    B, C, H, W = x.shape #B:批次，C:通道数，H:高，W:宽（H/W为空间尺寸）
     h = self.GroupNorm_0(x)
-    q = self.NIN_0(h)
+    #生成Q、K、V 通过1*1卷积实现通道维度转换
+    q = self.NIN_0(h) #形状：（B,C,H,W）
     k = self.NIN_1(h)
     v = self.NIN_2(h)
 
@@ -67,7 +68,9 @@ class AttnBlockpp(nn.Module):
     w = torch.reshape(w, (B, H, W, H * W))
     w = F.softmax(w, dim=-1)
     w = torch.reshape(w, (B, H, W, H, W))
+    #注意力加权求和，权重与V相乘
     h = torch.einsum('bhwij,bcij->bchw', w, v)
+    #跳跃连接，注意力输出与输入相加
     h = self.NIN_3(h)
     if not self.skip_rescale:
       return x + h
@@ -154,21 +157,25 @@ class ResnetBlockDDPMpp(nn.Module):
                dropout=0.1, skip_rescale=False, init_scale=0.):
     super().__init__()
     out_ch = out_ch if out_ch else in_ch
+    #归一化层（GroupNorm 适合小批量场景）
     self.GroupNorm_0 = nn.GroupNorm(num_groups=min(in_ch // 4, 32), num_channels=in_ch, eps=1e-6)
+    #3*3卷积层（特征转换）
     self.Conv_0 = conv3x3(in_ch, out_ch)
+    #时间嵌入处理（扩散模型中用于注入噪声水平信息）
     if temb_dim is not None:
-      self.Dense_0 = nn.Linear(temb_dim, out_ch)
+      self.Dense_0 = nn.Linear(temb_dim, out_ch)#线性映射，将时间嵌入映射到特征维度
       self.Dense_0.weight.data = default_init()(self.Dense_0.weight.data.shape)
       nn.init.zeros_(self.Dense_0.bias)
+    #第二组归一化和卷积
     self.GroupNorm_1 = nn.GroupNorm(num_groups=min(out_ch // 4, 32), num_channels=out_ch, eps=1e-6)
     self.Dropout_0 = nn.Dropout(dropout)
     self.Conv_1 = conv3x3(out_ch, out_ch, init_scale=init_scale)
+    #跳跃连接的适配（当输入输出通道不同时）
     if in_ch != out_ch:
       if conv_shortcut:
-        self.Conv_2 = conv3x3(in_ch, out_ch)
+        self.Conv_2 = conv3x3(in_ch, out_ch)  #卷积适配通道数
       else:
-        self.NIN_0 = NIN(in_ch, out_ch)
-
+        self.NIN_0 = NIN(in_ch, out_ch) #1*1卷积适配通道数
     self.skip_rescale = skip_rescale
     self.act = act
     self.out_ch = out_ch

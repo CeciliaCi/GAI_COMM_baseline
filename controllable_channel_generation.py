@@ -10,28 +10,33 @@ from channel_sampling import NoneCorrector, NonePredictor
 import functools
 from tqdm import tqdm as tqdm
 
-def map_complex_to_coeff(X):
+def map_complex_to_coeff(X): #将复数输入张量转换为实数系数张量
     """
-    :param X: (batch_size, n_tx, n_rx)
+    :param X: (batch_size, n_tx, n_rx)   
     :return: X_coeff: (batch_size, 2, n_tx, n_rx)
     """
-    return torch.view_as_real(X).permute(0,3,1,2)
+    return torch.view_as_real(X).permute(0,3,1,2)   # (batch_size, 2, n_tx, n_rx)（0，3，1，2）表示调整维度顺序
+                                                    # batch_size指的是模型训练是一次同时处理的样本数量
+                                                    
 
-def map_coeff_to_complex(X_coeff):
+def map_coeff_to_complex(X_coeff):#将实数系数张量转换为复数输入张量
     """
     :param: X_coeff: (batch_size, 2, n_tx, n_rx)
     :return X: (batch_size, n_tx, n_rx)
     """
-    return torch.view_as_complex(X_coeff.permute(0,2,3,1).contiguous())
+    return torch.view_as_complex(X_coeff.permute(0,2,3,1).contiguous()) #调整维度顺序，变换成这样(batch_size, n_tx, n_rx, 2)
+                                                                        #contiguous()是为了确保张量在内存中连续存储
 
-def condition_grad_fn(X_coefficients, Y, Pilot, channel_noise):
+def condition_grad_fn(X_coefficients, Y, Pilot, channel_noise):#该函数计算接收信号Y在信道H下的条件概率对数的梯度（即∇ₕ log P(Y|H)）
     """Return gradient of log_{H} P(Y|H)"""
     X = map_coeff_to_complex(X_coefficients) # (batch_size, n_tx, n_rx)
     Pilot_herm = torch.conj(torch.transpose(Pilot, -1, -2))
     log_grad = torch.matmul(Pilot, Y-torch.matmul(Pilot_herm, X))
     conditional_grad = log_grad/channel_noise # (batch_size, n_tx, n_rx)
-    conditional_grad = map_complex_to_coeff(conditional_grad) # (batch_size, 2, n_tx, n_rx)
+    conditional_grad = map_complex_to_coeff(conditional_grad) # (batch_size, 2, n_tx, n_rx) #
     return conditional_grad
+
+ 
 
 def conditional_predictor_update_fn(X_coefficients, t, Y, Pilot, channel_noise, model, sde, predictor, continuous, probability_flow):
   """
@@ -57,25 +62,34 @@ def conditional_predictor_update_fn(X_coefficients, t, Y, Pilot, channel_noise, 
 
   return predictor_obj.update_fn(X_coefficients, t)
 
+
+
 def conditional_corrector_update_fn(X_coefficients, t, Y, Pilot, channel_noise, model, sde, corrector, continuous, snr, n_steps):
+  #X_coefficients 信道矩阵H的实部和虚部；t 是扩散过程的时间步；Y接收到的导频信号测量值；Pilot发送的导频信号
+  #Channel_noise 信道噪声；model预训练的分数模型；sde随机微分方程定义；predictor预测器；continuous是否使用连续时间;probability_flow是否使用概率流
+  
   """The corrector update function for classifier-guided sampling."""
   score_fn = mutils.get_score_fn(sde, model, train=False, continuous=continuous)
 
-  def total_grad_fn(X_coefficients, t):
-    """:param X_coefficients: # (batch_size, 2, n_tx, n_rx) """
-    score = score_fn(X_coefficients, t)  # Score of real/img parts of H, [batch_size, 2, n_tx, n_rx]
+  def total_grad_fn(X_coefficients, t): #计算总分数梯度
+    """:param X_coefficients: # (batch_size, 2, n_tx, n_rx) """  
+    score = score_fn(X_coefficients, t)  # Score of real/img parts of H, [batch_size, 2, n_tx, n_rx] 
+                                         #得到信道矩阵H的先验分数，也就是模型预测的分布梯度
     cond_score = condition_grad_fn(X_coefficients, Y, Pilot, channel_noise)  # Score of likelihood P(Y|X), [batch_size, 2, n_tx, n_rx]
-    return score + cond_score
+                                         #得到信道矩阵H的概率分布梯度
+    return score + cond_score 
 
-  if corrector is None:
+  if corrector is None:         #判断是否传入了校正器对象，如果没有，就创建NoneCorrector对象并且实例化
     corrector_obj = NoneCorrector(sde, total_grad_fn, snr, n_steps)
   else:
-    corrector_obj = corrector(sde, total_grad_fn, snr, n_steps)
-  return corrector_obj.update_fn(X_coefficients, t)
+    corrector_obj = corrector(sde, total_grad_fn, snr, n_steps)#如果提供了校正器就直接实例化
+  return corrector_obj.update_fn(X_coefficients, t) #返回更新后的信道系数和可能的中间结果
 
 def get_pc_channel_sampler(sde, shape, predictor, corrector, snr,
                                n_steps=1, probability_flow=False,
                                continuous=False, denoise=True, eps=1e-5, device='cuda'):
+                               #这段代码实现了一个基于预测器-校正器方法的条件信道采样器，是扩散模型在MIMO场景下信道估计的核心应用
+                               #扩散模型的后向过程，从噪声逐步收敛到“符合观测数据和先验知识”的信道估计
   """Classifier-guided sampling with Predictor-Corrector (PC) samplers.
   @:param
     sde: An `sde_lib.SDE` object that represents the forward SDE.
@@ -119,13 +133,14 @@ def get_pc_channel_sampler(sde, shape, predictor, corrector, snr,
       Generated MIMO channels.
     """
     with torch.no_grad():
-      X_coefficients = sde.prior_sampling(shape).to(device) # (batch_size, 2, n_tx, n_rx)
-      timesteps = torch.linspace(sde.T, eps, sde.N, device=device)
-      nmse_log = []
+      X_coefficients = sde.prior_sampling(shape).to(device) # (batch_size, 2, n_tx, n_rx) 从先验分布(通常是标准高斯分布)采样初始噪声
+      timesteps = torch.linspace(sde.T, eps, sde.N, device=device) # 创建从最大时间T到最小时间eps的时间序列 sde.N表示时间总步数
+                                                                  #device指张量存放的设备
+      nmse_log = [] #每个时间步的估计误差 
       for i in tqdm(range(sde.N)):
-        t = timesteps[i]
-        vec_t = torch.ones(shape[0], device=t.device) * t
-        X_coefficients, X_mean = corrector_update_fn(X_coefficients=X_coefficients, t=vec_t, Y=Y, Pilot=Pilot, channel_noise=channel_noise, model=model)
+        t = timesteps[i]#获取当前时间步
+        vec_t = torch.ones(shape[0], device=t.device) * t #扩展到batch维度
+        X_coefficients, X_mean = corrector_update_fn(X_coefficients=X_coefficients, t=vec_t, Y=Y, Pilot=Pilot, channel_noise=channel_noise, model=model) #预测步骤
         X_coefficients, X_mean = predictor_update_fn(X_coefficients=X_coefficients, t=vec_t, Y=Y, Pilot=Pilot, channel_noise=channel_noise, model=model)
 
         X_test = X_mean if denoise else X_coefficients
@@ -134,8 +149,10 @@ def get_pc_channel_sampler(sde, shape, predictor, corrector, snr,
                         torch.sum(torch.square(torch.abs(ground_truth)),
                                   dim=(-1, -2))).cpu().numpy()
         nmse_log.append(val_nmse_log)
-      return X_test, sde.N * (n_steps + 1), nmse_log
+      return X_test, sde.N * (n_steps + 1), nmse_log  #  X_test最终的信道估计结果；sde.N * (n_steps + 1) 总计算步数；nmse_log每个时间步的估计误差
   return pc_channel_sampler
+
+  #校正器：在固定时间步对后验分布进行MCMC采样；预测器：沿着时间维度推进后验分布演化 
 
 
 
