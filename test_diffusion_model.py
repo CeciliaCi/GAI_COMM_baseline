@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import sys, copy, argparse
+import sys, copy, argparse, csv
+import os
+os.environ["PATH"] = os.path.dirname(sys.executable) + os.pathsep + os.environ.get("PATH", "")
 from controllable_channel_generation import get_pc_channel_sampler
 
 sys.path.append('./')
@@ -10,7 +12,6 @@ from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
-import os
 import torch
 from sde_score.losses import get_optimizer
 from sde_score.models.ema import ExponentialMovingAverage
@@ -24,6 +25,12 @@ from sde_score.models import ncsnv2, ncsnpp, layers, normalization
 from sde_score.models import ddpm as ddpm_model
 from sde_score.sde_lib import VESDE, VPSDE, subVPSDE
 from channel_sampling import (ReverseDiffusionPredictor, LangevinCorrector)
+
+
+def format_snr_value(snr):
+    if float(snr).is_integer():
+        return int(snr)
+    return float(snr)
 
 if __name__ == '__main__':
     # Args
@@ -43,6 +50,11 @@ if __name__ == '__main__':
     parser.add_argument('--model_pth', type=str, default='checkpoint_20.pth', help="File name of the saved model")
     parser.add_argument('--spacing', nargs='+', type=float, default=[0.5])
     parser.add_argument('--pilot_alpha', nargs='+', type=float, default=0.6)
+    parser.add_argument('--snr_values', nargs='+', type=float,
+                        default=[-15, -10, -5, 0, 5, 10, 15, 20],
+                        help='SNR values in dB for conditional DM evaluation.')
+    parser.add_argument('--num_test_sample', type=int, default=64,
+                        help='Number of validation channels to evaluate.')
     args = parser.parse_args()
 
     # Disable TF32 due to potential precision issues
@@ -58,7 +70,8 @@ if __name__ == '__main__':
 
     # Number of validation channels
     """ In our paper, we set num_test_sample=256 to get smooth plots, but this will take longer inference time"""
-    num_test_sample = 64
+    num_test_sample = args.num_test_sample
+    pilot_alpha = args.pilot_alpha[0] if isinstance(args.pilot_alpha, list) else args.pilot_alpha
 
     # Target file
     target_dir = f'models/DM/{args.train}/checkpoints/'
@@ -73,7 +86,7 @@ if __name__ == '__main__':
         if os.path.exists(ckpt_filename):
             print(f"Find the trained model at {ckpt_filename}")
         else:
-            assert("The model cannot be found")
+            raise FileNotFoundError(f"The model cannot be found: {ckpt_filename}")
         config = configs.get_config()
         config.data.scenario_list = expand_scenarios(args.train)
         config.data.image_size = infer_channel_image_size(
@@ -111,16 +124,13 @@ if __name__ == '__main__':
     val_config = copy.deepcopy(config)
     val_config.data.channel = args.test
     val_config.data.scenario_list = expand_scenarios(args.test)
-    val_config.data.num_pilots = int(np.floor(config.data.image_size[0] * args.pilot_alpha))
+    val_config.data.num_pilots = int(np.floor(config.data.image_size[0] * pilot_alpha))
     val_config.data.spacing_list = args.spacing
-    if args.train == 'O1_28':
-        val_dataset = Channels(val_seed, val_config, norm=[dataset.mean, dataset.std])
-    else:
-        val_dataset = Channels(val_seed, val_config, norm=config.data.norm_channels)
+    val_dataset = Channels(val_seed, val_config, norm=[dataset.mean, dataset.std])
 
 
     # Range of SNR
-    snr_range = np.arange(-10, 32.5, 2.5)
+    snr_range = np.asarray(args.snr_values, dtype=float)
     noise_range = 10 ** (-snr_range / 10.) * config.data.image_size[0]
 
     # Construct file to save results
@@ -161,22 +171,48 @@ if __name__ == '__main__':
         avg_nmse = np.mean(nmse_all, axis=-1)
         best_nmse = np.min(avg_nmse, axis=-1)
 
-        print(f"snr [dB]: {snr_range[snr_idx]}, nmse [dB]: {10*np.log10(best_nmse[snr_idx])}")
+        print(
+            f"snr [dB]: {snr_range[snr_idx]}, "
+            f"nmse: {best_nmse[snr_idx]}, "
+            f"nmse [dB]: {10*np.log10(best_nmse[snr_idx])}"
+        )
 
         # Save results to file based on noise
         save_dict = {'nmse_all': nmse_all,
                      'avg_nmse': avg_nmse,
                      'best_nmse': best_nmse,
                      'spacing': args.spacing,
-                     'pilot_alpha': args.pilot_alpha,
+                     'pilot_alpha': pilot_alpha,
+                     'num_test_sample': num_test_sample,
                      'snr_range': snr_range,
                      'val_config': val_config,
                      }
         torch.save(save_dict, os.path.join(result_dir, 'results.pt'))
 
+    csv_rows = [['SNR', 'DM']]
+    for snr, nmse in zip(snr_range, best_nmse):
+        csv_rows.append([format_snr_value(snr), float(nmse)])
+
+    with open(os.path.join(result_dir, 'results.csv'), 'w', newline='') as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(['SNR', 'dm'])
+        for snr, nmse in zip(snr_range, best_nmse):
+            writer.writerow([format_snr_value(snr), float(nmse)])
 
     # Plot result
     plt.rcParams['font.size'] = 14
+    plt.figure(figsize=(10, 10))
+    plt.plot(snr_range, best_nmse, linewidth=4, label=f"{args.test}, DM (trained in {args.train})")
+    plt.grid()
+    plt.legend()
+    plt.title('Channel estimation')
+    plt.xlabel('SNR [dB]')
+    plt.ylabel('NMSE')
+    plt.tight_layout()
+    plt.savefig(os.path.join(result_dir, 'results_mse.png'), dpi=300,
+                bbox_inches='tight')
+    plt.close()
+
     plt.figure(figsize=(10, 10))
     plt.plot(snr_range, 10 * np.log10(best_nmse), linewidth=4, label=f"{args.test}, DM (trained in {args.train})")
     plt.grid()
@@ -189,3 +225,4 @@ if __name__ == '__main__':
                 bbox_inches='tight')
     plt.close()
 
+    print(csv_rows)

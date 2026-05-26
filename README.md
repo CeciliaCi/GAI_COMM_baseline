@@ -34,7 +34,8 @@ The repository also supports LEO-NTN channel datasets with the naming rule `LEO_
 Example commands:
 
 ```bash
-python train_diffusion_model.py --gpu_id 0 --train Rural --workdir models/DM/Rural
+python train_diffusion_model.py --gpu_id 0 --train Rural --workdir models/DM/Rural --n_iters 200000 --no_snapshot_sampling
+python test_diffusion_model.py --gpu_id 0 --train Rural --test Rural --model_pth checkpoint_20.pth --snr_values -15 -10 -5 0 5 10 15 20
 python baseline_utils/wgan_gp.py --gpu 0 --train Rural
 python testcici.py --scenario Rural
 ```
@@ -51,6 +52,8 @@ python testcici.py --scenario Rural
     --train: scene for model training ("mixed", "O1_2B", "O1_28B", or "I2_28B")
     --test: scene for model test
     --model_pth: File name of the saved model (e.g., 'XXXX.pth')
+    --snr_values: SNR values in dB for evaluation
+    --num_test_sample: number of validation channels to evaluate
 ```
 + In [`test_diffusion_model.py`](./test_diffusion_model.py), we set `num_test_sample=64` (see line 52) to accelerate the conditional generating process. <br>
   > You may use `num_test_sample=256` to obtain smoother plots and reproduce results in our paper, but this will take longer inference time.

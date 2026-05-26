@@ -1,205 +1,254 @@
+import argparse
+import csv
+import math
 import os
 import sys
+
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
 
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 if PROJECT_DIR not in sys.path:
     sys.path.insert(0, PROJECT_DIR)
 
-from baseline_utils.wgan_helper import *
-import torch
-import numpy as np
-import matplotlib.pyplot as plt
-from loaders import _load_mat_file, expand_scenarios, load_channel_array, resolve_dataset_path
+from baseline_utils.wgan_helper import Variable, dtype
 from baseline_utils.wgan_gp import build_generator, load_dft_basis
-
-def loadValidateChannels(config, seed, mu_train, std_train):
-    channels, _ = load_channel_array(config.scenario_list, seed, config.num_paths)
-    channels = np.transpose(channels, (1, 2, 0))
-    channels = (channels - mu_train)/std_train  # Normalize
+from loaders import _load_mat_file, expand_scenarios, resolve_dataset_path
 
 
-    return np.asarray(channels)
+def load_channels_for_scenarios(scenario_list, seed, num_paths, max_samples=None):
+    channels = None
+    filenames = []
+    for scenario in scenario_list:
+        filename = resolve_dataset_path(scenario, seed, num_paths=num_paths)
+        filenames.append(filename)
+        contents = _load_mat_file(filename)
+        scenario_channels = np.asarray(contents['channels'], dtype=np.complex64)
+        if max_samples is not None:
+            scenario_channels = scenario_channels[:max_samples]
+        scenario_channels = scenario_channels.transpose((1, 2, 0))
+        if channels is None:
+            channels = scenario_channels
+        else:
+            channels = np.concatenate((channels, scenario_channels), axis=-1)
+    return channels, filenames
 
 
-# Disable TF32 due to potential precision issues
-torch.backends.cuda.matmul.allow_tf32 = False
-torch.backends.cudnn.allow_tf32 = False
-torch.backends.cudnn.benchmark = True
+def phase_levels_for_dimension(size):
+    return 2 ** int(math.ceil(math.log2(max(size, 1))))
 
 
-#Wireless Parameters
-latent_dim = 65
-train_seed, val_seed = 1111, 2222
+def training_precoder(n_tx, num_streams, phase_levels):
+    angles = np.linspace(0, 2 * np.pi, phase_levels, endpoint=False)
+    angle_index = np.random.choice(len(angles), (n_tx, num_streams))
+    return (1 / np.sqrt(n_tx)) * np.exp(1j * angles[angle_index])
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--gpu', type=int, default=2)
-parser.add_argument('--train', type=str, default='mixed')
-parser.add_argument('--test', type=str, default='mixed')
-parser.add_argument('--num_paths', type=int, default=10)
-parser.add_argument('--spacing', nargs='+', type=float, default=[0.5])
-parser.add_argument('--pilot_alpha', nargs='+', type=float, default=0.6)
-config = parser.parse_args()
 
-########################## Get statistics of training data ##########################
-config.train_scenario_list = expand_scenarios(config.train)
-H_ori = None
-for scenario in config.train_scenario_list:
-    H_org = _load_mat_file(resolve_dataset_path(scenario, train_seed, num_paths=config.num_paths))
-    if H_ori is None:
-        H_ori = H_org['channels'].transpose((1,2,0))
-    else:
-        H_ori = np.concatenate((H_ori,H_org['channels'].transpose((1,2,0))),-1)
-N_r, N_t = H_ori.shape[0], H_ori.shape[1]
-if N_t % 4 != 0 or N_r % 4 != 0:
-    raise ValueError(f'WGAN generator requires N_t and N_r divisible by 4, got N_t={N_t}, N_r={N_r}.')
-mu_train = np.zeros([1])
-std_train = np.std(H_ori)
+def training_combiner(n_rx, num_rx_rf, phase_levels):
+    angles = np.linspace(0, 2 * np.pi, phase_levels, endpoint=False)
+    angle_index = np.random.choice(len(angles), (n_rx, num_rx_rf))
+    weights = (1 / np.sqrt(n_rx)) * np.exp(1j * angles[angle_index])
+    return np.matrix(weights).getH()
 
-########################## Get normalized validation data ######################################
-config.test_scenario_list = expand_scenarios(config.test)
-H_ori = None
-for scenario in config.test_scenario_list:
-    H_org = _load_mat_file(resolve_dataset_path(scenario, val_seed, num_paths=config.num_paths))
-    if H_ori is None:
-        H_ori = H_org['channels'][:100].transpose((1,2,0))
-    else:
-        H_ori = np.concatenate((H_ori,H_org['channels'][:100].transpose((1,2,0))),-1)
-if H_ori.shape[0] != N_r or H_ori.shape[1] != N_t:
-    raise ValueError(
-        f'Train/test channel dimensions do not match: '
-        f'train N_r={N_r}, N_t={N_t}; '
-        f'test N_r={H_ori.shape[0]}, N_t={H_ori.shape[1]}.'
+
+def format_snr_value(snr):
+    if float(snr).is_integer():
+        return int(snr)
+    return float(snr)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--gpu', type=int, default=0)
+    parser.add_argument('--train', type=str, default='Rural')
+    parser.add_argument('--test', type=str, default='Rural')
+    parser.add_argument('--num_paths', type=int, default=10)
+    parser.add_argument('--spacing', nargs='+', type=float, default=[0.5])
+    parser.add_argument('--pilot_alpha', type=float, default=0.6)
+    parser.add_argument('--train_seed', type=int, default=1111)
+    parser.add_argument('--val_seed', type=int, default=2222)
+    parser.add_argument('--snr_values', nargs='+', type=float, default=[-15, -10, -5, 0, 5, 10, 15, 20])
+    parser.add_argument('--model_iter', type=int, default=58000)
+    parser.add_argument('--latent_dim', type=int, default=65)
+    parser.add_argument('--nrepeat', type=int, default=100)
+    parser.add_argument('--ntest', type=int, default=5)
+    parser.add_argument('--latent_steps', type=int, default=200)
+    parser.add_argument('--learning_rate', type=float, default=0.02)
+    parser.add_argument('--lambda_reg', type=float, default=1e-3)
+    config = parser.parse_args()
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(config.gpu)
+
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cudnn.benchmark = True
+
+    train_scenario_list = expand_scenarios(config.train)
+    test_scenario_list = expand_scenarios(config.test)
+    config.train_scenario_list = train_scenario_list
+    config.test_scenario_list = test_scenario_list
+
+    train_channels, train_files = load_channels_for_scenarios(
+        train_scenario_list,
+        config.train_seed,
+        config.num_paths,
     )
-H_ori = (H_ori-mu_train)/std_train # normalize
+    n_rx, n_tx = train_channels.shape[0], train_channels.shape[1]
+    if n_tx % 4 != 0 or n_rx % 4 != 0:
+        raise ValueError(f'WGAN generator requires N_t and N_r divisible by 4, got N_t={n_tx}, N_r={n_rx}.')
 
-length = int(N_t/4)
-breadth = int(N_r/4)
-G_test = build_generator(latent_dim, 1, length, breadth)
-A_T, A_R = load_dft_basis(N_t, N_r)
+    mu_train = np.zeros([1])
+    std_train = np.std(train_channels)
 
-H_extracted = np.transpose(copy.deepcopy(H_ori),(2,1,0))
-for i in range(H_ori.shape[2]):
-    H_extracted[i] = np.transpose(np.matmul(np.matmul(A_R.conj().T,H_extracted[i].T),A_T).astype(np.complex64))
-H_extracted_real = np.real(H_extracted)
-H_extracted_imag = np.imag(H_extracted)
+    test_channels, test_files = load_channels_for_scenarios(
+        test_scenario_list,
+        config.val_seed,
+        config.num_paths,
+        max_samples=config.nrepeat,
+    )
+    if test_channels.shape[0] != n_rx or test_channels.shape[1] != n_tx:
+        raise ValueError(
+            f'Train/test channel dimensions do not match: '
+            f'train N_r={n_rx}, N_t={n_tx}; '
+            f'test N_r={test_channels.shape[0]}, N_t={test_channels.shape[1]}.'
+        )
+    if test_channels.shape[2] < config.nrepeat:
+        raise ValueError(
+            f'Only {test_channels.shape[2]} test samples are available, '
+            f'but nrepeat={config.nrepeat}.'
+        )
+    test_channels = (test_channels - mu_train) / std_train
 
+    length = n_tx // 4
+    breadth = n_rx // 4
+    generator = build_generator(config.latent_dim, 1, length, breadth)
+    checkpoint = os.path.join(PROJECT_DIR, f'models/wgan_gp/{config.train}/generator{config.model_iter}.pt')
+    generator.load_state_dict(torch.load(checkpoint, map_location='cpu'))
+    generator.eval()
 
-A_T_R = np.kron(A_T.conj(),A_R)
-A_T_R_real = dtype(np.real(A_T_R))
-A_T_R_imag = dtype(np.imag(A_T_R))
+    a_t, a_r = load_dft_basis(n_tx, n_rx)
+    a_t_r = np.kron(a_t.conj(), a_r)
+    a_t_r_real = dtype(np.real(a_t_r))
+    a_t_r_imag = dtype(np.imag(a_t_r))
 
-N_s = N_r
-N_rx_rf = N_r
-Nbit_t = 6
-Nbit_r = 2
-angles_t = np.linspace(0,2*np.pi,2**Nbit_t,endpoint=False)
-angles_r = np.linspace(0,2*np.pi,2**Nbit_r,endpoint=False)
-freq = 2000
-model_vec = range(58000,60000,freq)
-#model_vec = range(18000,20000,freq)
+    num_streams = min(n_tx, n_rx)
+    num_rx_rf = n_rx
+    num_pilots = max(1, int(math.floor(config.pilot_alpha * n_tx)))
+    tx_phase_levels = phase_levels_for_dimension(n_tx)
+    rx_phase_levels = phase_levels_for_dimension(n_rx)
 
-def training_precoder(N_t,N_s):
-    angle_index = np.random.choice(len(angles_t),(N_t,N_s))
-    return (1/np.sqrt(N_t))*np.exp(1j*angles_t[angle_index])
+    snr_vec = np.asarray(config.snr_values, dtype=float)
+    nmse_all = np.zeros((len(snr_vec), config.nrepeat, config.ntest))
+    qpsk_constellation = (1 / np.sqrt(2)) * np.array([1 + 1j, 1 - 1j, -1 + 1j, -1 - 1j])
 
-def training_combiner(N_r,N_rx_rf):
-    angle_index = np.random.choice(len(angles_r),(N_r,N_rx_rf))
-    W = (1/np.sqrt(N_r))*np.exp(1j*angles_r[angle_index])
-    return np.matrix(W).getH()
+    pilot_sequence_ind = np.random.randint(0, 4, size=(num_streams, num_pilots))
+    symbols = qpsk_constellation[pilot_sequence_ind]
+    precoder_training = training_precoder(n_tx, num_streams, tx_phase_levels)
+    combiner = training_combiner(n_rx, num_rx_rf, rx_phase_levels)
+    sensing_matrix = np.kron(np.matmul(symbols.T, precoder_training.T), combiner)
 
-ntest = 5
-nrepeat = 100
-SNR_vec = np.arange(-10,32.5,2.5)
-pilot_alpha = config.pilot_alpha[0] if isinstance(config.pilot_alpha, list) else config.pilot_alpha
-nmse_all = np.zeros((len(SNR_vec),len(model_vec),nrepeat,ntest))
-N_p = int(pilot_alpha*N_t)
-qpsk_constellation = (1/np.sqrt(2))*np.array([1+1j,1-1j,-1+1j,-1-1j])
+    sensing_real = dtype(np.real(sensing_matrix))
+    sensing_imag = dtype(np.imag(sensing_matrix))
 
-pilot_sequence_ind = np.random.randint(0,4,size=(N_s,N_p))
-symbols = qpsk_constellation[pilot_sequence_ind]
-precoder_training = training_precoder(N_t,N_s)
-W = training_combiner(N_r,N_rx_rf)
-A = np.kron(np.matmul(symbols.T,precoder_training.T),W)
+    print(f'Loaded WGAN train data from: {train_files}')
+    print(f'Loaded WGAN test data from: {test_files}')
+    print(f'N_t={n_tx}, N_r={n_rx}, streams={num_streams}, rx_rf={num_rx_rf}, pilots={num_pilots}')
+    print(f'Using checkpoint: {checkpoint}')
 
-A_real = dtype(np.real(A))
-A_imag = dtype(np.imag(A))
-identity = np.identity(N_r)
-lambda_reg = 1e-3
+    for ind in range(config.nrepeat):
+        vec_h_single = np.reshape(test_channels[:, :, ind].flatten('F'), [n_rx * n_tx, 1])
+        noiseless_signal = np.matmul(test_channels[:, :, ind], np.matmul(precoder_training, symbols))
+        signal_power = np.multiply(noiseless_signal, np.conj(noiseless_signal))
 
-for midx, model in enumerate(model_vec):
-    G_test.load_state_dict(torch.load(os.path.join(PROJECT_DIR,f'models/wgan_gp/{config.train}/generator{model}.pt')))
-    G_test.eval()
-    for ind in range(nrepeat):
-        for snr_idx, SNR in enumerate(SNR_vec):
-            for i in range(ntest):
-                vec_H_single = np.reshape(H_ori[:,:,ind].flatten('F'),[N_r*N_t,1])
-                signal = np.matmul(H_ori[:,:,ind],np.matmul(precoder_training,symbols)) # [n_rx, n_pilot]
-                E_s = np.multiply(signal,np.conj(signal)) #[n_r, n_pilot]
-                noise_matrix = (1/np.sqrt(2))*(np.random.randn(N_r,N_p)+1j*np.random.randn(N_r,N_p))
-                vec_y = np.zeros((N_rx_rf*N_p,1,1),dtype='complex64') #[n_rx*n_pilot, 1, 1]
-                std_dev = (1/(10**(SNR/20)))*np.sqrt(E_s)
-                rx_signal = signal + np.multiply(std_dev,noise_matrix)
-                rx_signal = np.matmul(W,rx_signal)
-                vec_y[:,0,0] = rx_signal.flatten('F') # [n_rx*n_pilot, 1]
-                vec_y_real = dtype(np.real(vec_y[:,:,0]))
-                vec_y_imag = dtype(np.imag(vec_y[:,:,0]))
-                def gen_output(x):
-                    pred = G_test(x)
-                    pred_real = torch.mm(A_T_R_real,pred[0,0,:,:].view(N_t*N_r,-1)) - torch.mm(A_T_R_imag,pred[0,1,:,:].view(N_t*N_r,-1))
-                    pred_imag = torch.mm(A_T_R_real,pred[0,1,:,:].view(N_t*N_r,-1)) + torch.mm(A_T_R_imag,pred[0,0,:,:].view(N_t*N_r,-1))
-                    diff_real = vec_y_real - torch.mm(A_real,pred_real) + torch.mm(A_imag,pred_imag)
-                    diff_imag = vec_y_imag - torch.mm(A_real,pred_imag) - torch.mm(A_imag,pred_real)
-                    diff = torch.norm(diff_real) ** 2 + torch.norm(diff_imag) ** 2
-                    return diff + lambda_reg*torch.norm(x)**2
-                x = Variable(torch.randn(1, latent_dim)).type(dtype)
-                x.requires_grad = True
-                learning_rate = 0.02
-                optimizer = torch.optim.Adam([x], lr=learning_rate)
-                for a in range(200):
+        for snr_idx, snr in enumerate(snr_vec):
+            for test_idx in range(config.ntest):
+                noise_matrix = (1 / np.sqrt(2)) * (
+                    np.random.randn(n_rx, num_pilots) + 1j * np.random.randn(n_rx, num_pilots)
+                )
+                std_dev = (1 / (10 ** (snr / 20))) * np.sqrt(signal_power)
+                rx_signal = noiseless_signal + np.multiply(std_dev, noise_matrix)
+                rx_signal = np.matmul(combiner, rx_signal)
+
+                vec_y = np.zeros((num_rx_rf * num_pilots, 1, 1), dtype='complex64')
+                vec_y[:, 0, 0] = rx_signal.flatten('F')
+                vec_y_real = dtype(np.real(vec_y[:, :, 0]))
+                vec_y_imag = dtype(np.imag(vec_y[:, :, 0]))
+
+                def gen_output(latent):
+                    pred = generator(latent)
+                    pred_real = torch.mm(a_t_r_real, pred[0, 0, :, :].view(n_tx * n_rx, -1)) - torch.mm(
+                        a_t_r_imag,
+                        pred[0, 1, :, :].view(n_tx * n_rx, -1),
+                    )
+                    pred_imag = torch.mm(a_t_r_real, pred[0, 1, :, :].view(n_tx * n_rx, -1)) + torch.mm(
+                        a_t_r_imag,
+                        pred[0, 0, :, :].view(n_tx * n_rx, -1),
+                    )
+                    diff_real = vec_y_real - torch.mm(sensing_real, pred_real) + torch.mm(sensing_imag, pred_imag)
+                    diff_imag = vec_y_imag - torch.mm(sensing_real, pred_imag) - torch.mm(sensing_imag, pred_real)
+                    return torch.norm(diff_real) ** 2 + torch.norm(diff_imag) ** 2 + config.lambda_reg * torch.norm(latent) ** 2
+
+                latent = Variable(torch.randn(1, config.latent_dim)).type(dtype)
+                latent.requires_grad = True
+                optimizer = torch.optim.Adam([latent], lr=config.learning_rate)
+                for _ in range(config.latent_steps):
                     optimizer.zero_grad()
-                    loss = gen_output(x)
+                    loss = gen_output(latent)
                     loss.backward()
                     optimizer.step()
-                gen_imgs = G_test(x).data.cpu().numpy()
-                gen_imgs_complex = gen_imgs[0,0,:,:] + 1j*gen_imgs[0,1,:,:]
-                gen_imgs_complex = np.matmul(A_T_R,np.reshape(gen_imgs_complex,[N_t*N_r,1]))
-                val_nmse_all = (np.sum(np.square(np.abs(gen_imgs_complex - vec_H_single)))/ np.sum(np.square(np.abs(vec_H_single))))
-                nmse_all[snr_idx, midx, ind, i] = val_nmse_all
-                print(SNR, model, val_nmse_all)
-        print(SNR, nmse_all[snr_idx, 0,:].min(-1).mean())
 
-avg_nmse = nmse_all.min(axis=-1).mean(axis=-1)
+                gen_imgs = generator(latent).data.cpu().numpy()
+                gen_imgs_complex = gen_imgs[0, 0, :, :] + 1j * gen_imgs[0, 1, :, :]
+                gen_imgs_complex = np.matmul(a_t_r, np.reshape(gen_imgs_complex, [n_tx * n_rx, 1]))
+                nmse = np.sum(np.square(np.abs(gen_imgs_complex - vec_h_single))) / np.sum(np.square(np.abs(vec_h_single)))
+                nmse_all[snr_idx, ind, test_idx] = nmse
+                print(snr, config.model_iter, nmse)
 
-result_dir = os.path.join(PROJECT_DIR, f'results/wgan_gp/train{config.train}_test{config.test}')
-os.makedirs(result_dir, exist_ok=True)
-plt.figure(figsize=(10, 10))
-plt.plot(SNR_vec, 10 * np.log10(avg_nmse), linewidth=4, label='test scenario: %s' % config.test)
-plt.grid()
-plt.legend()
-plt.title('WGAN based channel estimation')
-plt.xlabel('SNR [dB]')
-plt.ylabel('NMSE')
-plt.tight_layout()
-plt.savefig(os.path.join(result_dir, 'results.png'), dpi=300,
-                bbox_inches='tight')
-plt.close()
+        print(f'sample {ind + 1}/{config.nrepeat}, current avg NMSE: {nmse_all.min(axis=-1)[:, :ind + 1].mean(axis=-1)}')
 
-plt.figure(figsize=(10, 10))
-plt.plot(SNR_vec, avg_nmse,  linewidth=4, label='test scenario: %s' % config.test)
-plt.grid()
-plt.legend()
-plt.title('WGAN based channel estimation')
-plt.xlabel('SNR [dB]')
-plt.ylabel('NMSE')
-plt.tight_layout()
-plt.savefig(os.path.join(result_dir, 'results_mse.png'), dpi=300,
-                bbox_inches='tight')
-plt.close()
+    wgan_nmse = nmse_all.min(axis=-1).mean(axis=-1)
 
-save_dict = {'nmse_all': nmse_all,
-                 'avg_nmse': avg_nmse,
-                 'pilot_alpha': pilot_alpha,
-                 'snr_range': SNR_vec,
-                 'config': config,
-                 }
-torch.save(save_dict, os.path.join(result_dir, 'results.pt'))
+    result_dir = os.path.join(PROJECT_DIR, f'results/wgan_gp/train{config.train}_test{config.test}')
+    os.makedirs(result_dir, exist_ok=True)
+
+    plt.rcParams['font.size'] = 14
+    plt.figure(figsize=(10, 10))
+    plt.plot(snr_vec, wgan_nmse, linewidth=4, label='test scenario: %s' % config.test)
+    plt.grid()
+    plt.legend()
+    plt.title('WGAN based channel estimation')
+    plt.xlabel('SNR [dB]')
+    plt.ylabel('NMSE')
+    plt.tight_layout()
+    plt.savefig(os.path.join(result_dir, 'results_mse.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
+    csv_rows = [['SNR', 'WGAN']]
+    for snr, nmse in zip(snr_vec, wgan_nmse):
+        csv_rows.append([format_snr_value(snr), float(nmse)])
+
+    with open(os.path.join(result_dir, 'results.csv'), 'w', newline='') as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(['SNR', 'wgan'])
+        for snr, nmse in zip(snr_vec, wgan_nmse):
+            writer.writerow([format_snr_value(snr), float(nmse)])
+
+    save_dict = {
+        'nmse_all': nmse_all,
+        'avg_nmse': wgan_nmse,
+        'pilot_alpha': config.pilot_alpha,
+        'snr_range': snr_vec,
+        'config': config,
+        'checkpoint': checkpoint,
+        'n_tx': n_tx,
+        'n_rx': n_rx,
+    }
+    torch.save(save_dict, os.path.join(result_dir, 'results.pt'))
+
+    print(csv_rows)
+
+
+if __name__ == '__main__':
+    main()

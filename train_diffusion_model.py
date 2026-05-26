@@ -1,7 +1,8 @@
 """
 Training diffusion model by score-based SDE
 """
-import os
+import os, sys
+os.environ["PATH"] = os.path.dirname(sys.executable) + os.pathsep + os.environ.get("PATH", "")
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:516"
 import sde_score.run_lib as run_lib
 import logging
@@ -47,6 +48,10 @@ if __name__ == "__main__":
   parser.add_argument('--scenario_list', type=list, default=['O1_28B', 'O1_28', 'I2_28B'])
   parser.add_argument('--workdir', type=str, default='')
   parser.add_argument('--eval_folder', type=str, default='eval')
+  parser.add_argument('--n_iters', type=int, default=None,
+                      help='Override config.training.n_iters for this run.')
+  parser.add_argument('--no_snapshot_sampling', action='store_true',
+                      help='Disable conditional sampling at training snapshots.')
   args = parser.parse_args()
   args.scenario_list = expand_scenarios(args.train)
   if args.train == 'O1_28':
@@ -68,6 +73,10 @@ if __name__ == "__main__":
       seed=1111,
       num_paths=config.data.num_paths,
   )
+  if args.n_iters is not None:
+    config.training.n_iters = args.n_iters
+  if args.no_snapshot_sampling:
+    config.training.snapshot_sampling = False
   if not args.workdir:
     args.workdir = os.path.join('models', 'DM', args.train)
   args.config = config

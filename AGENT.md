@@ -7,7 +7,10 @@
 在进行规划与实现前，必须先通读并理解以下文档中的现有设计、术语与实验假设：
 
 1. [README.md](README.md)
-2. [GAI_COMM.md](GAI_COMM.md)
+2. [GAI_COMM.md](documents/GAI_COMM.md)
+3. 如果任务涉及扩散模型，阅读 [Diffusion.md](/root/autodl-tmp/GAI_COMM/documents/Diffusion.md)
+4. 如果任务涉及 ML baseline，阅读 [ML.md](documents/ML.md)
+5. 如果任务涉及 WGAN baseline，阅读 [WGAN.md](documents/WGAN.md)
 
 > 要求：先阅读上述文档，再进行任务。
 
@@ -38,7 +41,7 @@
 
 1. 训练 batch size、SDE 类型、噪声尺度、NCSN++ 网络结构、优化器、数据归一化、天线维度、路径数、导频数和采样步数等默认值应集中在 `configs/default_CE_configs.py` 与具体配置文件中。
 2. 命令行参数只负责选择 GPU、训练场景、测试场景、checkpoint、导频比例、天线间距和输出路径等实验入口参数。
-3. 新增配置字段时，需要同步更新配置文件、调用入口、README 和 [LEO_CE_BASELINE.md](LEO_CE_BASELINE.md)。
+3. 新增配置字段时，需要同步更新配置文件、调用入口、`README.md`、`documents/GAI_COMM.md` 以及对应的方法文档。
 4. 随机种子、数据集文件名规则、归一化方式、SNR 扫描范围、样本数量和输出目录属于可复现实验假设，修改时必须在文档或配置中同步说明。
 5. 不要在模型代码中隐藏新的实验默认值；若必须引入公式常数或数值稳定项，应在就近注释中说明其用途。
 
@@ -55,8 +58,12 @@
 ## 5. 任务收尾
 
 对于会改变代码逻辑、实验入口、配置默认值、数据格式或输出结果的改动，你都需要同步维护以下文档：
-
 1. [README.md](README.md)
-2. [GAI_COMM.md](GAI_COMM.md)
+2. [GAI_COMM.md](documents/GAI_COMM.md)
+3. 如果任务涉及扩散模型，阅读 [Diffusion.md](/root/autodl-tmp/GAI_COMM/documents/Diffusion.md)
+4. 如果任务涉及 ML baseline，阅读 [ML.md](documents/ML.md)
+5. 如果任务涉及 WGAN baseline，阅读 [WGAN.md](documents/WGAN.md)
 
-维护文档时必须保持口径一致，直接描述项目当前设计和当前模型。需要表达限制时，写成稳定的实现边界；需要表达扩展方向时，写成明确的后续工作，不混入当前已实现能力。
+## 6. 任务约束
+
+编写代码不要编写冒烟测试和单独测试
